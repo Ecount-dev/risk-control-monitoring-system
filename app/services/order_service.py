@@ -4,8 +4,12 @@ from decimal import Decimal
 from uuid import UUID
 
 from app.core.errors import ConflictError, NotFoundError
-from app.domain.entities import Execution, Order, Position, RiskDecision
+from app.domain.entities import Fill, Order, Position, RiskDecision
 from app.domain.enums import ExecutionKind, OrderSide, OrderStatus
+from app.domain.events import (
+    FillRecorded, OrderCreated, OrderStateChanged, PositionOpened, RiskEvaluated,
+)
+from app.domain.snapshots import OrderSnapshot, PositionSnapshot
 from app.domain.state_machine import transition_order
 from app.repositories.memory import InMemoryDatabase
 from app.services.account_service import AccountService
@@ -34,11 +38,15 @@ class OrderService:
         side: OrderSide,
         volume: Decimal,
         requested_price: Decimal,
+        strategy_id: str | None = None,
+        signal_id: UUID | None = None,
+        causation_id: UUID | None = None,
     ) -> Order:
         """创建订单、执行风控，并返回 ACCEPTED 或 REJECTED 订单。
 
         拒绝订单仍会保存，因为交易系统需要知道用户提交过什么以及拒绝原因。
         """
+        self._require_simulated_execution()
         # 从读取账户到写入风控结果作为一个不可被其他线程打断的整体。
         with self.db.lock:
             account = self.accounts.get(account_id)
@@ -51,8 +59,17 @@ class OrderService:
                 side=side,
                 volume=volume,
                 requested_price=requested_price,
+                strategy_id=strategy_id,
+                signal_id=signal_id,
             )
             self.db.orders[order.id] = order
+            # 先保存 PENDING_RISK 的快照。后续状态变化不会改写这条事件。
+            created = OrderCreated(
+                event_time=order.created_at, source="order_service",
+                correlation_id=signal_id or order.id, causation_id=causation_id,
+                payload=OrderSnapshot.from_order(order),
+            )
+            self.db.record_event(created)
 
             # evaluate 返回业务结果而不是抛异常；拒绝下单本身不是服务器故障。
             decision = self.risk.evaluate(
@@ -61,6 +78,12 @@ class OrderService:
                 rule=rule,
             )
             self.db.risk_decisions[order.id] = decision
+            evaluated = RiskEvaluated(
+                event_time=decision.evaluated_at, source="risk_service",
+                correlation_id=created.correlation_id, causation_id=created.event_id,
+                payload=decision,
+            )
+            self.db.record_event(evaluated)
 
             if decision.passed:
                 transition_order(order, OrderStatus.ACCEPTED)
@@ -68,6 +91,12 @@ class OrderService:
                 order.reject_reason = decision.reason
                 transition_order(order, OrderStatus.REJECTED)
 
+            self.db.record_event(OrderStateChanged(
+                event_time=order.updated_at, source="order_service",
+                correlation_id=created.correlation_id, causation_id=evaluated.event_id,
+                previous_status=OrderStatus.PENDING_RISK,
+                payload=OrderSnapshot.from_order(order),
+            ))
             return order
 
     def get(self, order_id: UUID) -> Order:
@@ -110,9 +139,16 @@ class OrderService:
 
     def cancel(self, order_id: UUID) -> Order:
         """撤销订单；状态机只允许 ACCEPTED -> CANCELLED。"""
+        self._require_simulated_execution()
         with self.db.lock:
             order = self.get(order_id)
+            previous_status = order.status
             transition_order(order, OrderStatus.CANCELLED)
+            self.db.record_event(OrderStateChanged(
+                event_time=order.updated_at, source="order_service",
+                correlation_id=order.signal_id or order.id,
+                previous_status=previous_status, payload=OrderSnapshot.from_order(order),
+            ))
             return order
 
     def fill(self, order_id: UUID) -> tuple[Order, Position]:
@@ -121,6 +157,7 @@ class OrderService:
         真实数据库版本中，订单状态、成交记录和持仓必须在同一个事务中提交；
         任意一步失败时都要整体回滚。
         """
+        self._require_simulated_execution()
         with self.db.lock:
             order = self.get(order_id)
 
@@ -139,27 +176,51 @@ class OrderService:
 
             # 市价订单使用成交瞬间的最新行情，而不是提交订单时的参考价格。
             quote = self.market.require_quote_for_execution(order.symbol)
-            execution = Execution(
-                kind=ExecutionKind.OPEN,
-                order_id=order.id,
-                symbol=order.symbol,
-                side=order.side,
-                volume=order.volume,
-                price=quote.price,
-            )
             position = Position(
                 account_id=order.account_id,
                 opening_order_id=order.id,
                 symbol=order.symbol,
                 side=order.side,
                 volume=order.volume,
-                open_price=execution.price,
+                open_price=quote.price,
+                venue=order.venue,
+                strategy_id=order.strategy_id,
             )
-            execution.position_id = position.id
+            # Fill 是不可变成交事实，关联 ID 在构造时一次性填全。
+            execution = Fill(
+                kind=ExecutionKind.OPEN, account_id=order.account_id,
+                order_id=order.id, position_id=position.id,
+                symbol=order.symbol, side=order.side, volume=order.volume,
+                price=quote.price, venue=order.venue, strategy_id=order.strategy_id,
+            )
+            position.opened_at = execution.executed_at
 
             # 所有前置检查成功后才修改订单并写入成交、持仓。
             transition_order(order, OrderStatus.FILLED)
             order.filled_price = execution.price
             self.db.executions[execution.id] = execution
             self.db.positions[position.id] = position
+            filled = FillRecorded(
+                event_time=execution.executed_at, source="order_service",
+                correlation_id=order.signal_id or order.id, payload=execution,
+            )
+            self.db.record_event(filled)
+            self.db.record_event(OrderStateChanged(
+                event_time=order.updated_at, source="order_service",
+                correlation_id=filled.correlation_id, causation_id=filled.event_id,
+                previous_status=OrderStatus.ACCEPTED, payload=OrderSnapshot.from_order(order),
+            ))
+            self.db.record_event(PositionOpened(
+                event_time=execution.executed_at, source="order_service",
+                correlation_id=filled.correlation_id, causation_id=filled.event_id,
+                payload=PositionSnapshot.from_position(position),
+            ))
             return order, position
+
+    def _require_simulated_execution(self) -> None:
+        """实时行情接入不等于 MT5 下单；禁止伪造券商成交。"""
+        if self.db.market_source != "sim":
+            raise ConflictError(
+                code="LIVE_EXECUTION_UNAVAILABLE",
+                message="当前仅接入 MT5 只读行情，尚未实现真实 OMS/ExecutionGateway；不能下单或模拟成交",
+            )

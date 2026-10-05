@@ -13,6 +13,7 @@ from collections import deque
 from decimal import Decimal
 
 from app.domain.enums import OrderSide
+from app.domain.validation import trading_decimal
 from app.strategy.base import Signal, Strategy
 from app.strategy.context import MarketContext
 
@@ -27,8 +28,10 @@ class MovingAverageCrossoverStrategy(Strategy):
         slow_window: int = 20,
         order_volume: Decimal = Decimal("0.1"),
     ) -> None:
-        if fast_window >= slow_window:
-            raise ValueError("fast_window 必须小于 slow_window")
+        if (type(fast_window) is not int or type(slow_window) is not int
+                or not 0 < fast_window < slow_window):
+            raise ValueError("窗口必须是整数且满足 0 < fast_window < slow_window")
+        trading_decimal(order_volume, "order_volume")
         self.fast_window = fast_window
         self.slow_window = slow_window
         self.order_volume = order_volume

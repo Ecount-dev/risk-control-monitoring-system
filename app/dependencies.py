@@ -8,6 +8,8 @@ from typing import Annotated
 
 from fastapi import Depends, Request
 
+from app.adapters.market_data import MarketDataAdapter
+from app.core.errors import ConflictError
 from app.repositories.memory import InMemoryDatabase
 from app.services.account_service import AccountService
 from app.services.market_service import MarketDataService
@@ -34,6 +36,17 @@ def get_market_service(db: Database) -> MarketDataService:
     return MarketDataService(db)
 
 
+def get_live_market_adapter(request: Request) -> MarketDataAdapter:
+    """实时行情路由只能在 MT5 模式读取终端，不回退到模拟报价。"""
+    adapter = request.app.state.mt5_adapter
+    if adapter is None:
+        raise ConflictError(
+            code="MT5_MARKET_MODE_REQUIRED",
+            message="当前是模拟模式；请设置 MARKET_SOURCE=mt5 后重启",
+        )
+    return adapter
+
+
 def get_order_service(db: Database) -> OrderService:
     """为当前请求创建订单服务。"""
     return OrderService(db)
@@ -47,5 +60,6 @@ def get_position_service(db: Database) -> PositionService:
 # 路由使用这些类型别名后，函数签名更短，也仍能获得编辑器类型提示。
 AccountServiceDep = Annotated[AccountService, Depends(get_account_service)]
 MarketServiceDep = Annotated[MarketDataService, Depends(get_market_service)]
+LiveMarketAdapterDep = Annotated[MarketDataAdapter, Depends(get_live_market_adapter)]
 OrderServiceDep = Annotated[OrderService, Depends(get_order_service)]
 PositionServiceDep = Annotated[PositionService, Depends(get_position_service)]

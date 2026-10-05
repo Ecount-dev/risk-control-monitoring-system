@@ -7,27 +7,13 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
-from dataclasses import dataclass
-from decimal import Decimal
 from typing import TYPE_CHECKING
 
-from app.domain.enums import OrderSide
+# 兼容原有 from app.strategy.base import Signal；全项目只有一个 Signal 定义。
+from app.domain.signals import Signal
 
 if TYPE_CHECKING:
     from app.strategy.context import MarketContext
-
-
-@dataclass(frozen=True, slots=True)
-class Signal:
-    """策略产出的交易意图，只描述「何时、买卖方向、数量、原因」。
-
-    它不包含成交价格、订单状态等执行细节——那些由下单管道决定。
-    """
-
-    side: OrderSide
-    symbol: str
-    volume: Decimal
-    reason: str
 
 
 class Strategy(ABC):

@@ -2,11 +2,15 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 from decimal import Decimal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from app.domain.entities import Order
 from app.domain.enums import PositionStatus
+from app.domain.events import SignalGenerated
+from app.domain.market import InstrumentId
+from app.domain.validation import DomainValidationError, clean_text
 from app.repositories.memory import InMemoryDatabase
 from app.services.account_service import AccountService
 from app.services.market_service import MarketDataService
@@ -32,10 +36,17 @@ class StrategyRunner:
         db: InMemoryDatabase,
         strategy: Strategy,
         account_id: UUID,
+        *,
+        strategy_id: str | None = None,
     ) -> None:
         self.db = db
         self.strategy = strategy
         self.account_id = account_id
+        # 实例 ID 区分两个同类策略；需要跨重启稳定追踪时应显式传入。
+        self.strategy_id = clean_text(
+            strategy_id if strategy_id is not None else f"{type(strategy).__name__}-{uuid4()}",
+            "strategy_id",
+        )
 
         self.accounts = AccountService(db)
         self.market = MarketDataService(db)
@@ -59,7 +70,18 @@ class StrategyRunner:
         # 4. 有信号就走既有的下单管道；风控在这一步把关。
         if signal is None:
             return None
-        return self._place_order(signal, context.quote.price)
+        # 当前 Runner 仅处理 SIM 场所；不能用 A 品种行情给 B 品种订单估值。
+        if signal.instrument_id != InstrumentId(context.symbol):
+            raise DomainValidationError("signal.instrument_id", "必须与触发本次决策的模拟行情一致")
+        if signal.strategy_id not in (None, self.strategy_id):
+            raise DomainValidationError("signal.strategy_id", "必须属于当前策略实例")
+        signal = replace(signal, strategy_id=self.strategy_id)
+        generated = SignalGenerated(
+            event_time=signal.event_time, source="strategy_runner",
+            correlation_id=signal.id, payload=signal,
+        )
+        self.db.record_event(generated)
+        return self._place_order(signal, context.quote.price, generated.event_id)
 
     def _build_context(self, symbol: str) -> MarketContext:
         quote = self.market.get_quote(symbol)
@@ -78,7 +100,9 @@ class StrategyRunner:
             risk_rule=rule,
         )
 
-    def _place_order(self, signal: Signal, requested_price: Decimal) -> Order:
+    def _place_order(
+        self, signal: Signal, requested_price: Decimal, causation_id: UUID,
+    ) -> Order:
         # 市价单以当前报价作为参考价；真正的成交价仍由成交时行情决定。
         return self.orders.create(
             self.account_id,
@@ -86,4 +110,7 @@ class StrategyRunner:
             side=signal.side,
             volume=signal.volume,
             requested_price=requested_price,
+            strategy_id=signal.strategy_id,
+            signal_id=signal.id,
+            causation_id=causation_id,
         )

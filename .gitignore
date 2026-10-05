@@ -7,3 +7,5 @@ __pycache__/
 htmlcov/
 .idea/
 .vscode/
+# 本地只读行情采样库及 SQLite WAL 临时文件；不提交券商数据。
+data/*.sqlite3*

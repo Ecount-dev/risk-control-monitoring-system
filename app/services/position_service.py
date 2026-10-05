@@ -4,8 +4,10 @@ from decimal import Decimal
 from uuid import UUID
 
 from app.core.errors import ConflictError, NotFoundError
-from app.domain.entities import Execution, Position, utc_now
+from app.domain.entities import Fill, Position
 from app.domain.enums import ExecutionKind, OrderSide, PositionStatus
+from app.domain.events import AccountSettled, FillRecorded, PositionClosed
+from app.domain.snapshots import AccountSettlement, PositionSnapshot
 from app.repositories.memory import InMemoryDatabase
 from app.services.account_service import AccountService
 from app.services.market_service import MarketDataService
@@ -54,6 +56,11 @@ class PositionService:
 
         真实数据库版本应把平仓成交、持仓更新和账户余额更新放在同一事务中。
         """
+        if self.db.market_source != "sim":
+            raise ConflictError(
+                code="LIVE_EXECUTION_UNAVAILABLE",
+                message="当前仅接入 MT5 只读行情，尚未实现真实平仓接口",
+            )
         with self.db.lock:
             position = self.get(position_id)
             if position.status != PositionStatus.OPEN:
@@ -65,6 +72,14 @@ class PositionService:
 
             # 平仓价取执行动作发生时的最新行情。
             quote = self.market.require_quote_for_execution(position.symbol)
+            # 查找依赖资源也属于前置检查，避免之后因缺账户而留下半更新状态。
+            account = self.accounts.get(position.account_id)
+            # 外部恢复的持仓可能暂时找不到本地开仓订单；仍可用原始 ID 串事件。
+            opening_order = self.db.orders.get(position.opening_order_id)
+            correlation_id = (
+                (opening_order.signal_id or opening_order.id)
+                if opening_order is not None else position.opening_order_id
+            )
             realized_pnl = self.calculate_pnl(
                 side=position.side,
                 open_price=position.open_price,
@@ -77,26 +92,50 @@ class PositionService:
                 if position.side == OrderSide.BUY
                 else OrderSide.BUY
             )
-            execution = Execution(
+            execution = Fill(
                 kind=ExecutionKind.CLOSE,
+                account_id=position.account_id,
                 position_id=position.id,
                 symbol=position.symbol,
                 side=closing_side,
                 volume=position.volume,
                 price=quote.price,
+                venue=position.venue,
+                strategy_id=position.strategy_id,
             )
 
             # 持仓进入终态后记录不会删除，以便保留交易历史。
             position.status = PositionStatus.CLOSED
             position.close_price = quote.price
             position.realized_pnl = realized_pnl
-            position.closed_at = utc_now()
+            position.closed_at = execution.executed_at
 
             # 已实现盈亏正式进入余额；浮动盈亏则从不直接修改余额。
-            account = self.accounts.get(position.account_id)
             account.balance += realized_pnl
             account.realized_pnl += realized_pnl
             self.db.executions[execution.id] = execution
+            # 沿用开仓订单的关联 ID，以便串起信号、开仓到平仓的整条链路。
+            filled = FillRecorded(
+                event_time=execution.executed_at, source="position_service",
+                correlation_id=correlation_id,
+                payload=execution,
+            )
+            self.db.record_event(filled)
+            closed = PositionClosed(
+                event_time=position.closed_at, source="position_service",
+                correlation_id=filled.correlation_id, causation_id=filled.event_id,
+                payload=PositionSnapshot.from_position(position),
+            )
+            self.db.record_event(closed)
+            self.db.record_event(AccountSettled(
+                event_time=position.closed_at, source="position_service",
+                correlation_id=filled.correlation_id, causation_id=closed.event_id,
+                payload=AccountSettlement(
+                    account_id=account.id, position_id=position.id,
+                    realized_pnl_delta=realized_pnl, balance=account.balance,
+                    realized_pnl=account.realized_pnl,
+                ),
+            ))
             return position
 
     def to_view(self, position: Position) -> dict:

@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "fastapi-trading-risk-demo"
 version = "0.1.0"
-description = "A learning-oriented simulated trading order and risk-control API"
+description = "A trading research API with read-only MT5 prices and isolated simulated execution"
 requires-python = ">=3.11"
 dependencies = [
     "fastapi>=0.116",
@@ -16,6 +16,9 @@ dependencies = [
 dev = [
     "httpx2>=2.9",
     "pytest>=8.4",
+]
+mt5 = [
+    "metatrader5>=5.0.6231; sys_platform == 'win32'",
 ]
 
 [tool.setuptools.packages.find]

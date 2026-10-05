@@ -1,9 +1,11 @@
 """模拟行情的写入、查询及成交前检查。"""
 
 from decimal import Decimal
+from uuid import uuid4
 
 from app.core.errors import ConflictError, NotFoundError
 from app.domain.entities import MarketQuote
+from app.domain.events import QuoteUpdated
 from app.repositories.memory import InMemoryDatabase
 
 
@@ -15,14 +17,19 @@ class MarketDataService:
 
     def update_quote(self, symbol: str, price: Decimal) -> MarketQuote:
         """标准化品种代码并覆盖其上一条报价。"""
-        symbol = symbol.strip().upper()
+        self._require_sim_mode()
         quote = MarketQuote(symbol=symbol, price=price)
         with self.db.lock:
-            self.db.quotes[symbol] = quote
+            self.db.quotes[quote.symbol] = quote
+            self.db.record_event(QuoteUpdated(
+                event_time=quote.updated_at, source="market_service",
+                correlation_id=uuid4(), payload=quote,
+            ))
         return quote
 
     def get_quote(self, symbol: str) -> MarketQuote:
         """获取最新报价；普通查询缺失时返回 404。"""
+        self._require_sim_mode()
         symbol = symbol.strip().upper()
         with self.db.lock:
             quote = self.db.quotes.get(symbol)
@@ -48,3 +55,11 @@ class MarketDataService:
                 message=f"{symbol} 暂无模拟行情，不能成交或平仓",
                 details={"symbol": symbol},
             ) from exc
+
+    def _require_sim_mode(self) -> None:
+        """保护服务的直接调用者，不能把实盘 Tick 混成模拟单价格。"""
+        if self.db.market_source != "sim":
+            raise ConflictError(
+                code="SIMULATED_MARKET_DISABLED",
+                message="MT5 行情模式下不能使用模拟报价服务",
+            )
